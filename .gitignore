@@ -73,3 +73,6 @@ coverage/
 # --- ログ ---
 *.log
 logs/
+
+.dev.vars*
+!.dev.vars.example
