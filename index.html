@@ -132,43 +132,63 @@ const PI_HEX_DIGITS_NEEDED = 16384; // hex digits
 function ab2hex(buf) { return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join(''); }
 function hex2ab(hex) { if(hex.length%2!==0) hex='0'+hex; const u8=new Uint8Array(hex.length/2); for(let i=0;i<u8.length;i++) u8[i]=parseInt(hex.substr(i*2,2),16); return u8.buffer; }
 function xor(a,b){ const ua=new Uint8Array(a), ub=new Uint8Array(b); const out=new Uint8Array(ua.length); for(let i=0;i<ua.length;i++) out[i]=ua[i]^ub[i]; return out.buffer; }
+function concatArrayBuffers(buf1, buf2) {
+  const tmp = new Uint8Array(buf1.byteLength + buf2.byteLength);
+  tmp.set(new Uint8Array(buf1), 0);
+  tmp.set(new Uint8Array(buf2), buf1.byteLength);
+  return tmp.buffer;
+}
 
 // --- Pi hex generation via Machin formula ---
-function arctan_scaled(x, scale) {
+function arctan_scaled(x, scale, precisionBits) {
   let sum = 0n;
   let x_pow = BigInt(x); // x^(1)
   let k = 0n;
+  // 必要なビット数（hex 桁数 * 4）に少し余裕を持たせる
+  const limit = BigInt(precisionBits);
   while (true) {
     const denom = x_pow * (2n*k+1n);
-    const term = scale / denom;
-    if (term === 0n) break;
-    if (Number(k%2n) === 0) sum += term; else sum -= term;
-    x_pow *= BigInt(x) * BigInt(x); // increase exponent by 2
+    const term = scale / denom;   // 切り捨て除算
+    if (term === 0n) break;       // これ以上寄与がないとき終了
+    if (Number(k%2n) === 0) sum += term;
+    else sum -= term;
+    // 次の項へ: x_pow *= x^2
+    x_pow *= BigInt(x) * BigInt(x);
     k += 1n;
+    // 安全策：イテレーション数が大きくなりすぎたら強制終了
+    if (k > 10n * limit) break;
   }
   return sum;
 }
 async function generatePiHexDigits(N) {
-  if (piHexCache && piHexCache.length >= N) return piHexCache.slice(0,N);
-  // scale = 16^N
+  if (piHexCache && piHexCache.length >= N) return piHexCache.slice(0, N);
+
+  // N 個の 16進桁 = N*4 ビット。誤差を吸収するために +8 ビット余裕を持たせる
+  const precisionBits = N * 4 + 8;
   const scale = BigInt(16) ** BigInt(N);
-  const a5 = arctan_scaled(5, scale);
-  const a239 = arctan_scaled(239, scale);
-  let pi_scaled = (16n * a5) - (4n * a239);
-  // Convert to hex string, ensure enough digits
+
+  const a5  = arctan_scaled(5,  scale, precisionBits);
+  const a239= arctan_scaled(239, scale, precisionBits);
+
+  let pi_scaled = (16n * a5) - (4n * a239); // これで 16^N * π の整数近似
+  // 16進文字列に変換（符号は絶対に出ないはずだが、念のため）
   let hex = pi_scaled.toString(16);
-  // Remove possible leading '-' (should not happen)
   if (hex.startsWith('-')) hex = hex.slice(1);
-  // Pad with leading zeros to length N (since scale = 16^N, we expect at most N digits, maybe less)
+  // 必要な長さに合わせてパッドまたは切り詰め
   if (hex.length < N) hex = '0'.repeat(N - hex.length) + hex;
-  else if (hex.length > N) hex = hex.slice(0, N); // take most significant N digits
+  else if (hex.length > N) hex = hex.slice(0, N);
+
   piHexCache = hex;
   return piHexCache;
 }
 
 // Initialize pi hex at startup
+let piReady = false;
 (async () => {
   await generatePiHexDigits(PI_HEX_DIGITS_NEEDED);
+  piReady = true;
+  // ボタンを有効にする（必要なら）
+  document.querySelectorAll('button').forEach(b => b.disabled = false);
   console.log('Pi hex generated, length:', piHexCache.length);
 })();
 
@@ -240,28 +260,20 @@ async function encryptModeC(plaintext, password, offset, order) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const key = await deriveKey(password, salt);
-  let aesResult;
-  let piResult;
   if(order === 'AthenB'){
     // inner A (Pi XOR) then outer B (AES-GCM)
-    piResult = encryptPiXOR(plaintext, offset);
-    aesResult = await encryptAES(key, iv, piResult, makeHeader(2,0,salt,iv)); // mode=2, flags=0
+    const piResult = encryptPiXOR(plaintext, offset);
+    const headerAES = makeHeader(2,0,salt,iv); // mode=2, flags=0
+    const ciphertextAES = await encryptAES(key, iv, piResult, headerAES);
+    return {header: headerAES, ciphertext: ciphertextAES};
   }else{
     // inner B then outer A
-    aesResult = await encryptAES(key, iv, plaintext, makeHeader(2,0,salt,iv)); // temporary header will be replaced
-    piResult = encryptPiXOR(aesResult, offset);
-    // final header for mode C with flags=1
-    const header = makeHeader(2,1,salt,iv);
-    // Need to prepend header to piResult; we'll return header+piResult
-    return {header, ciphertext: piResult};
+    const headerAES = makeHeader(2,0,salt,iv); // temporary header for AES encryption
+    const ciphertextAES = await encryptAES(key, iv, plaintext, headerAES);
+    const piResult = encryptPiXOR(ciphertextAES, offset);
+    const headerFinal = makeHeader(2,1,salt,iv); // mode=2, flags=1
+    return {header: headerFinal, ciphertext: piResult};
   }
-  // For AthenB case, we have header from encryptAES (which includes salt/iv) and ciphertext aesResult
-  // Need to apply outer Pi XOR after AES? Wait order AthenB: inner A then outer B, meaning AES outer.
-  // Actually we did: inner A => piResult, then encrypt AES => aesResult with header.
-  // That's correct: outer is AES, inner is Pi.
-  // So return header from AES and ciphertext aesResult.
-  const header = makeHeader(2,0,salt,iv);
-  return {header, ciphertext: aesResult};
 }
 async function decryptModeC(ciphertextWithHeader, password, offset) {
   const hdr = parseHeader(ciphertextWithHeader);
@@ -270,18 +282,17 @@ async function decryptModeC(ciphertextWithHeader, password, offset) {
   const iv = hdr.iv;
   const key = await deriveKey(password, salt);
   const payload = ciphertextWithHeader.slice(35); // after header
-  let intermediate;
+  let plain;
   if(hdr.flags === 0){
     // AthenB: inner A then outer B => decrypt AES first then Pi XOR
     const aesDec = await decryptAES(key, iv, payload, ciphertextWithHeader.slice(0,35));
-    intermediate = encryptPiXOR(aesDec, offset); // Pi XOR decrypt
+    plain = encryptPiXOR(aesDec, offset); // Pi XOR decrypt
   }else{
     // BthenA: inner B then outer A => Pi XOR first then AES decrypt
     const piDec = encryptPiXOR(payload, offset); // Pi XOR decrypt
-    const aesDec = await decryptAES(key, iv, piDec, ciphertextWithHeader.slice(0,35));
-    intermediate = aesDec;
+    plain = await decryptAES(key, iv, piDec, ciphertextWithHeader.slice(0,35));
   }
-  return intermediate;
+  return plain;
 }
 
 // --- UI Logic ---
@@ -331,6 +342,7 @@ function readFileAsArrayBufferWithProgress(file, onProgress){
 
 // Mode B
 document.getElementById('encB').onclick=async()=>{
+  if (!piReady) { alert('Pi ヘックス列の生成がまだ完了していません。しばらくお待ちください。'); return; }
   const file=document.getElementById('fileB').files[0];
   if(!file) return alert('ファイルを選択');
   const pwd=document.getElementById('pwdB').value;
@@ -355,6 +367,7 @@ document.getElementById('encB').onclick=async()=>{
   }
 };
 document.getElementById('decB').onclick=async()=>{
+  if (!piReady) { alert('Pi ヘックス列の生成がまだ完了していません。しばらくお待ちください。'); return; }
   const file=document.getElementById('fileB').files[0];
   if(!file) return alert('ファイルを選択');
   const pwd=document.getElementById('pwdB').value;
@@ -380,6 +393,7 @@ document.getElementById('decB').onclick=async()=>{
 
 // Mode A
 document.getElementById('encA').onclick=async()=>{
+  if (!piReady) { alert('Pi ヘックス列の生成がまだ完了していません。しばらくお待ちください。'); return; }
   const file=document.getElementById('fileA').files[0];
   if(!file) return alert('ファイルを選択');
   const offset=parseInt(document.getElementById('offsetA').value);
@@ -401,6 +415,7 @@ document.getElementById('encA').onclick=async()=>{
   }
 };
 document.getElementById('decA').onclick=async()=>{
+  if (!piReady) { alert('Pi ヘックス列の生成がまだ完了していません。しばらくお待ちください。'); return; }
   const file=document.getElementById('fileA').files[0];
   if(!file) return alert('ファイルを選択');
   const offset=parseInt(document.getElementById('offsetA').value);
@@ -425,6 +440,7 @@ document.getElementById('decA').onclick=async()=>{
 
 // Mode C
 document.getElementById('encC').onclick=async()=>{
+  if (!piReady) { alert('Pi ヘックス列の生成がまだ完了していません。しばらくお待ちください。'); return; }
   const file=document.getElementById('fileC').files[0];
   if(!file) return alert('ファイルを選択');
   const pwd=document.getElementById('pwdC').value;
@@ -448,6 +464,7 @@ document.getElementById('encC').onclick=async()=>{
   }
 };
 document.getElementById('decC').onclick=async()=>{
+  if (!piReady) { alert('Pi ヘックス列の生成がまだ完了していません。しばらくお待ちください。'); return; }
   const file=document.getElementById('fileC').files[0];
   if(!file) return alert('ファイルを選択');
   const pwd=document.getElementById('pwdC').value;
@@ -482,7 +499,7 @@ async function selfTest(){
     const header=makeHeader(1,0,salt,iv);
     const key=await deriveKey('testpass',salt);
     const ct=await encryptAES(key,iv,plain,header);
-    const pt=await decryptAES(key,hdr.iv,ct,header);
+    const pt=await decryptAES(key,header.iv,ct,header);
     if(!new Uint8Array(pt).every((v,i)=>v===plain[i])) throw new Error(' mismatch');
     logEl.innerHTML+='✓ モードB 自己テスト OK<br>';
   }catch(e){ logEl.innerHTML+='✗ モードB 自己テスト失敗: '+e+'<br>'; }
@@ -501,7 +518,8 @@ async function selfTest(){
     const pwd='testpass';
     const offset=123;
     const {header, ciphertext}=await encryptModeC(plain, pwd, offset, 'AthenB');
-    const pt=await decryptModeC(header.concat(ciphertext), pwd, offset);
+    const combined = concatArrayBuffers(header, ciphertext);
+    const pt=await decryptModeC(combined, pwd, offset);
     if(!new Uint8Array(pt).every((v,i)=>v===plain[i])) throw new Error(' mismatch');
     logEl.innerHTML+='✓ モードC AthenB 自己テスト OK<br>';
   }catch(e){ logEl.innerHTML+='✗ モードC AthenB 自己テスト失敗: '+e+'<br>'; }
@@ -511,7 +529,8 @@ async function selfTest(){
     const pwd='testpass';
     const offset=123;
     const {header, ciphertext}=await encryptModeC(plain, pwd, offset, 'BthenA');
-    const pt=await decryptModeC(header.concat(ciphertext), pwd, offset);
+    const combined = concatArrayBuffers(header, ciphertext);
+    const pt=await decryptModeC(combined, pwd, offset);
     if(!new Uint8Array(pt).every((v,i)=>v===plain[i])) throw new Error(' mismatch');
     logEl.innerHTML+='✓ モードC BthenA 自己テスト OK<br>';
   }catch(e){ logEl.innerHTML+='✗ モードC BthenA 自己テスト失敗: '+e+'<br>'; }
@@ -520,6 +539,7 @@ selfTest();
 
 // Attack demo for mode A
 document.getElementById('attackBtnA').onclick=async()=>{
+  if (!piReady) { alert('Pi ヘックス列の生成がまだ完了していません。しばらくお待ちください。'); return; }
   const logEl=document.getElementById('attackLog');
   logEl.textContent='';
   const fileInput=document.createElement('input');
@@ -584,6 +604,7 @@ document.getElementById('attackBtnA').onclick=async()=>{
 
 // Attack demo for mode B (should fail)
 document.getElementById('attackBtnB').onclick=async()=>{
+  if (!piReady) { alert('Pi ヘックス列の生成がまだ完了していません。しばらくお待ちください。'); return; }
   const logEl=document.getElementById('attackLog');
   logEl.textContent='';
   const fileInput=document.createElement('input');
