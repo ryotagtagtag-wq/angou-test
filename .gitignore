@@ -1,0 +1,75 @@
+# ============================================
+# pi-crypt .gitignore
+# 単一HTML + 暗号デモ用リポジトリ
+# ============================================
+
+# --- 暗号成果物(最重要) ---
+# 暗号化出力・復号結果・攻撃デモの産物は絶対にコミットしない
+*.picr
+*.enc
+*.dec
+*.decrypted
+*.out
+/out/
+/output/
+/decrypted/
+/attack-results/
+
+# --- 鍵・パスワード・秘密 ---
+*.key
+*.pem
+*.p12
+*.pfx
+*.asc
+*.gpg
+.env
+.env.*
+!.env.example
+secrets/
+passwords.txt
+*.secret
+
+# --- テスト用データ ---
+# 大きなサンプルや自分のファイルを誤って入れない
+/samples/private/
+/fixtures/large/
+*.bin
+*.tmp
+*.bak
+test-*.png
+test-*.pdf
+test-*.zip
+
+# --- OS ---
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# --- エディタ / IDE ---
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Node(テストやビルドを後で足す場合) ---
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+dist/
+.cache/
+coverage/
+
+# --- Cloudflare / ローカル配備 ---
+.wrangler/
+.dev.vars
+.mf/
+
+# --- ログ ---
+*.log
+logs/
